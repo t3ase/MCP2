@@ -60,6 +60,68 @@ function addHistory(from: string, entry: HistoryEntry) {
   history.set(from, list);
 }
 
+// -------- STATS HELPERS --------
+
+function getUserStats(from: string) {
+  const entries = history.get(from) ?? [];
+  if (!entries.length) return null;
+
+  const moodCounts = new Map<string, number>();
+  const languageCounts = new Map<string, number>();
+  const playlistCounts = new Map<string, number>();
+
+  for (const h of entries) {
+    const moodKey = h.mood.toLowerCase();
+    moodCounts.set(moodKey, (moodCounts.get(moodKey) ?? 0) + 1);
+
+    const langKey = h.language.toLowerCase();
+    languageCounts.set(langKey, (languageCounts.get(langKey) ?? 0) + 1);
+
+    const playlistKey = (h.playlistName || h.playlistId).toLowerCase();
+    playlistCounts.set(playlistKey, (playlistCounts.get(playlistKey) ?? 0) + 1);
+  }
+
+  const topEntry = (m: Map<string, number>) => {
+    let bestKey: string | null = null;
+    let bestCount = 0;
+    for (const [k, v] of m.entries()) {
+      if (v > bestCount) {
+        bestKey = k;
+        bestCount = v;
+      }
+    }
+    return { key: bestKey, count: bestCount };
+  };
+
+  const topMood = topEntry(moodCounts);
+  const topLanguage = topEntry(languageCounts);
+  const topPlaylist = topEntry(playlistCounts);
+
+  const findPlaylistNameFromKey = (key: string | null): string | null => {
+    if (!key) return null;
+    const entry = entries.find(
+      (e) =>
+        (e.playlistName || e.playlistId).toLowerCase() === key.toLowerCase()
+    );
+    return entry?.playlistName || entry?.playlistId || null;
+  };
+
+  const first = entries[0].lastUsedAt;
+  const last = entries[entries.length - 1].lastUsedAt;
+
+  return {
+    totalPlays: entries.length,
+    topMood: topMood.key,
+    topMoodCount: topMood.count,
+    topLanguage: topLanguage.key,
+    topLanguageCount: topLanguage.count,
+    topPlaylistName: findPlaylistNameFromKey(topPlaylist.key),
+    topPlaylistCount: topPlaylist.count,
+    first,
+    last,
+  };
+}
+
 webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
   try {
     const from = req.body.From as string | undefined;
@@ -86,7 +148,8 @@ webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
       const vibe = current.vibe || null;
       const artist = current.lastArtist || null;
       const track = current.lastTrack || null;
-      const intent = (current.lastIntent as ClassificationResult["intent"]) || "playlist";
+      const intent =
+        (current.lastIntent as ClassificationResult["intent"]) || "playlist";
 
       let previous: HistoryEntry | undefined;
       if (mood) {
@@ -224,7 +287,72 @@ webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
       current.lastPlaylistId;
 
     /**
-     * 2a. If user already has playlist_shown, support "repeat" and "change_vibe"
+     * 2a. STATS COMMAND – either explicit text ("stats") or AI intent "user_stats"
+     */
+    const normalizedCommand = textLower.replace(/\s+/g, " ").trim();
+    const isStatsCommand =
+      normalizedCommand === "stats" ||
+      normalizedCommand === "my stats" ||
+      normalizedCommand === "show my stats";
+
+    // Cast intent to string so TS doesn't complain about "user_stats" not being in the union yet
+    const isStatsIntent = (intent as unknown as string) === "user_stats";
+
+    if (isStatsCommand || isStatsIntent) {
+      const stats = getUserStats(from);
+      const replyLines: string[] = [];
+
+      if (!stats) {
+        replyLines.push(
+          "I don't have any stats for you yet.",
+          "Ask me for a playlist first (for example: 'sad english', 'chill hindi', or 'songs from drake')."
+        );
+      } else {
+        const firstDate = new Date(stats.first);
+        const lastDate = new Date(stats.last);
+        const firstStr = firstDate.toLocaleString("en-IN", {
+          year: "numeric",
+          month: "short",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        const lastStr = lastDate.toLocaleString("en-IN", {
+          year: "numeric",
+          month: "short",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+
+        const diffMs = lastDate.getTime() - firstDate.getTime();
+        const retentionDays = Math.max(
+          1,
+          Math.round(diffMs / (1000 * 60 * 60 * 24))
+        );
+
+        replyLines.push(
+          "📊 Your listening stats:",
+          "",
+          `• Total playlists I've sent you: ${stats.totalPlays}`,
+          `• Most requested mood: ${stats.topMood ?? "N/A"} (${stats.topMoodCount} times)`,
+          `• Top language: ${stats.topLanguage ?? "N/A"} (${stats.topLanguageCount} times)`,
+          `• Most re-used playlist: ${
+            stats.topPlaylistName ?? "N/A"
+          } (${stats.topPlaylistCount} times)`,
+          "",
+          `• First playlist: ${firstStr}`,
+          `• Latest playlist: ${lastStr}`,
+          `• You've been using me for about ${retentionDays} day(s).`
+        );
+      }
+
+      await sendTwilioMessage(from, replyLines.filter(Boolean).join("\n"));
+      return res.json({ ok: true });
+    }
+
+    /**
+     * 2b. If user already has playlist_shown, support "repeat" and "change_vibe"
      */
 
     // REPEAT
@@ -285,7 +413,9 @@ webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
         const first = tracks[0];
 
         replyLines.push(
-          `🌊 Changing vibe to "${newVibe || "different"}" for your "${baseMood}" mood in "${baseLanguage}":`,
+          `🌊 Changing vibe to "${
+            newVibe || "different"
+          }" for your "${baseMood}" mood in "${baseLanguage}":`,
           `Playlist: ${playlistMeta.name}`,
           playlistMeta.url ? `Playlist link: ${playlistMeta.url}` : "",
           "",
@@ -329,7 +459,7 @@ webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
     }
 
     /**
-     * 2b. Brand new request (or normal classification)
+     * 2c. Brand new request (or normal classification)
      */
 
     // If we still have absolutely no idea what they want (very unlikely)
