@@ -7,9 +7,16 @@ import { classifyMoodAndLanguage } from "../clients/openaiClient";
 
 export const webhooksRouter = Router();
 
+// ───────────────────────────────── Types & In-memory state ─────────────────────
+
+type SessionStage = "idle" | "waiting_language" | "playlist_shown";
+
 type SessionState = {
-  stage: "idle" | "waiting_language";
+  stage: SessionStage;
   mood?: string;
+  language?: string;
+  vibe?: string | null;
+  lastPlaylistId?: string;
 };
 
 type HistoryEntry = {
@@ -25,7 +32,7 @@ const sessions = new Map<string, SessionState>();
 const history = new Map<string, HistoryEntry[]>();
 
 function normalizeText(text: string | undefined): string {
-  return (text || "").trim().toLowerCase();
+  return (text || "").trim();
 }
 
 function getLastHistory(
@@ -49,17 +56,25 @@ function addHistory(from: string, entry: HistoryEntry) {
   history.set(from, list);
 }
 
-/**
- * Shared helper: builds the reply message (history + main playlist +
- * optional alternate playlist), sends it to the user, and records
- * the new playlist in history.
- */
-async function respondWithPlaylist(from: string, mood: string, language: string) {
-  // Check if user has used this mood+language before
-  const previous = getLastHistory(from, mood, language);
-  const excludeId = previous?.playlistId;
+// Helper: send playlist recommendation + update history + session
+async function sendPlaylistRecommendation(opts: {
+  from: string;
+  mood: string;
+  language: string;
+  vibe?: string | null;
+  excludePlaylistId?: string;
+  res: any;
+}) {
+  const { from, mood, language, vibe, excludePlaylistId, res } = opts;
 
-  const tracks = await getPlaylistForMood(mood, language, excludeId);
+  const previous = getLastHistory(from, mood, language);
+  const excludeId = excludePlaylistId ?? previous?.playlistId;
+
+  // Combine mood + vibe for search, e.g. "sad slow"
+  const moodForQuery = vibe ? `${mood} ${vibe}` : mood;
+
+  const tracks = await getPlaylistForMood(moodForQuery, language, excludeId);
+
   const playlistMeta = (tracks as any).playlist as
     | { id: string; name: string; url?: string }
     | undefined;
@@ -82,44 +97,42 @@ async function respondWithPlaylist(from: string, mood: string, language: string)
 
     replyLines.push(
       `📅 Last time you listened to a "${mood}" playlist in "${language}" was on ${dateStr}.`,
-      `Same playlist: ${previous.playlistName || "(no name)"}`,
+      `Same playlist: ${previous.playlistName || "(no name)"}` +
+        (previous.playlistUrl ? `\nSame playlist link: ${previous.playlistUrl}` : "")
     );
-    if (previous.playlistUrl) {
-      replyLines.push(`Same playlist link: ${previous.playlistUrl}`);
-    }
     replyLines.push(""); // blank line
   }
 
-  // 2) Now present the "new" playlist (different from previous if possible)
+  // 2) New / alternate playlist
   if (!tracks.length || !playlistMeta) {
     replyLines.push(
-      `I couldn't find any new playlists for mood "${mood}" in language "${language}".`,
-      `Try another combination like "happy + english" or "sad + hindi".`,
+      `I couldn't find any playlists for mood "${mood}" in language "${language}".`,
+      `Try another combo like "happy english", "sad hindi", etc.`
     );
   } else {
     const first = tracks[0];
 
     replyLines.push(
-      `🎧 Here's an alternate playlist for "${mood}" in "${language}":`,
+      `🎧 Here's a playlist for "${mood}" in "${language}"` +
+        (vibe ? ` with a "${vibe}" vibe:` : ":"),
       `Playlist: ${playlistMeta.name}`,
       playlistMeta.url ? `Playlist link: ${playlistMeta.url}` : "",
       "",
       `Song: ${first.name}`,
       `Artists: ${first.artists}`,
-      first.url ? `Song link: ${first.url}` : "",
+      first.url ? `Song link: ${first.url}` : ""
     );
 
-    // If Spotify gave us an extra alternate playlist, mention it too
     if (altMeta && altMeta.url) {
       replyLines.push(
         "",
         `You can also try this other playlist:`,
         `Alt playlist: ${altMeta.name}`,
-        `Alt link: ${altMeta.url}`,
+        `Alt link: ${altMeta.url}`
       );
     }
 
-    // Save this new playlist in history
+    // Save this playlist in history
     addHistory(from, {
       mood,
       language,
@@ -128,11 +141,24 @@ async function respondWithPlaylist(from: string, mood: string, language: string)
       playlistUrl: playlistMeta.url,
       lastUsedAt: new Date().toISOString(),
     });
+
+    // And remember in session for follow-up ("something else", "slower", etc.)
+    sessions.set(from, {
+      stage: "playlist_shown",
+      mood,
+      language,
+      vibe: vibe ?? null,
+      lastPlaylistId: playlistMeta.id,
+    });
   }
 
   const reply = replyLines.filter(Boolean).join("\n");
   await sendTwilioMessage(from, reply);
+
+  return res.json({ ok: true });
 }
+
+// ───────────────────────────────── WhatsApp webhook ────────────────────────────
 
 webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
   try {
@@ -145,59 +171,108 @@ webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
       return res.status(400).json({ ok: false, error: "missing_from_or_body" });
     }
 
-    const current = sessions.get(from) || { stage: "idle" as const };
-    logger.info({ from, text, session: current }, "Incoming WhatsApp message");
+    const session = sessions.get(from) || { stage: "idle" as SessionStage };
+    logger.info({ from, text, session }, "Incoming WhatsApp message");
 
-    // ── STEP 2: user is answering with LANGUAGE ───────────────────────
-    if (current.stage === "waiting_language" && current.mood) {
-      const mood = current.mood;
-      const language = text;
+    // ── 1. If playlist was just shown, interpret follow-up ("something else", "slower", etc.) ──
+    if (session.stage === "playlist_shown") {
+      const ai = await classifyMoodAndLanguage(text);
 
-      // reset session
+      if (ai.intent === "more") {
+        const mood = (session.mood || ai.mood || "chill").toLowerCase();
+        const language = (session.language || ai.language || "english").toLowerCase();
+        const vibe = ai.vibe || session.vibe || null;
+
+        return await sendPlaylistRecommendation({
+          from,
+          mood,
+          language,
+          vibe,
+          excludePlaylistId: session.lastPlaylistId,
+          res,
+        });
+      }
+
+      if (ai.intent === "repeat" && session.lastPlaylistId) {
+        // Simple "repeat" – just treat as same playlist again without exclude
+        const mood = (session.mood || ai.mood || "chill").toLowerCase();
+        const language = (session.language || ai.language || "english").toLowerCase();
+        const vibe = ai.vibe || session.vibe || null;
+
+        return await sendPlaylistRecommendation({
+          from,
+          mood,
+          language,
+          vibe,
+          res,
+        });
+      }
+
+      // Otherwise treat as a brand-new request and fall through
       sessions.set(from, { stage: "idle" });
+    }
 
-      await respondWithPlaylist(from, mood, language);
+    // ── 2. If we're waiting for language only ─────────────────────────────────
+    if (session.stage === "waiting_language" && session.mood) {
+      const language = text.toLowerCase();
+      const mood = session.mood.toLowerCase();
+      const vibe = session.vibe || null;
+
+      return await sendPlaylistRecommendation({
+        from,
+        mood,
+        language,
+        vibe,
+        res,
+      });
+    }
+
+    // ── 3. New request: use OpenAI to classify mood + language + vibe ─────────
+    const ai = await classifyMoodAndLanguage(text);
+
+    const mood = (ai.mood || text || "").toLowerCase();
+    const detectedLanguage = ai.language ? ai.language.toLowerCase() : null;
+    const vibe = ai.vibe ? ai.vibe.toLowerCase() : null;
+
+    // If language not detected clearly -> ask user
+    if (!detectedLanguage) {
+      sessions.set(from, {
+        stage: "waiting_language",
+        mood,
+        vibe,
+      });
+
+      const reply =
+        `Got it, you're feeling "${mood}"` +
+        (vibe ? ` with a "${vibe}" vibe.` : ".") +
+        `\nWhich language do you prefer? (english, hindi, punjabi, tamil, telugu, etc)`;
+
+      await sendTwilioMessage(from, reply);
       return res.json({ ok: true });
     }
 
-    // ── STEP 1: use OpenAI to detect MOOD + LANGUAGE (if possible) ────
-    // Use raw text for better understanding by the model
-    const classification = await classifyMoodAndLanguage(bodyRaw || text);
-
-    logger.info(
-      { from, classification },
-      "OpenAI mood/language classification"
-    );
-
-    // Decide mood & language based on classifier, falling back to plain text
-    const detectedMood =
-      classification.mood && classification.confidence >= 0.5
-        ? classification.mood.toLowerCase()
-        : text;
-
-    const detectedLanguage =
-      classification.language && classification.confidence >= 0.5
-        ? classification.language.toLowerCase()
-        : null;
-
-    // Case A: We confidently have both mood and language -> go straight to playlist
-    if (detectedLanguage) {
-      sessions.set(from, { stage: "idle" });
-      await respondWithPlaylist(from, detectedMood, detectedLanguage);
-      return res.json({ ok: true });
-    }
-
-    // Case B: Only mood detected (or classifier unsure about language) -> ask for language
-    sessions.set(from, { stage: "waiting_language", mood: detectedMood });
-
-    const reply =
-      `Got it, your mood is "${detectedMood}".\n` +
-      `Now tell me your language preference (for example: english, hindi, punjabi, tamil, telugu...).`;
-
-    await sendTwilioMessage(from, reply);
-    return res.json({ ok: true });
+    // If language is known, go straight to recommendation
+    const language = detectedLanguage;
+    return await sendPlaylistRecommendation({
+      from,
+      mood,
+      language,
+      vibe,
+      res,
+    });
   } catch (err: any) {
     logger.error({ err }, "Error handling Twilio WhatsApp webhook");
+    try {
+      if (req.body?.From) {
+        await sendTwilioMessage(
+          req.body.From,
+          "Sorry, something went wrong on my side. Try again in a moment 🙏"
+        );
+      }
+    } catch {
+      // ignore Twilio errors in error handler
+    }
+
     res.status(500).json({
       ok: false,
       error: "internal_error",
