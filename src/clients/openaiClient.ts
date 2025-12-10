@@ -1,97 +1,189 @@
 // src/clients/openaiClient.ts
 import OpenAI from "openai";
 import { config } from "../config/env";
+import { logger } from "../utils/logger";
 
 const client = new OpenAI({
-  apiKey: config.openai.apiKey,
+  apiKey: config.openai.apiKey || process.env.OPENAI_API_KEY || "",
 });
 
-export type MoodLanguageResult = {
+export type IntentType =
+  | "playlist"
+  | "artist_search"
+  | "repeat"
+  | "change_vibe"
+  | "other";
+
+export type ClassificationResult = {
   mood: string | null;
   language: string | null;
   vibe: string | null;
-  intent: string; // "new" | "more" | "repeat" | "other" etc.
+  artist: string | null;
+  track: string | null;
+  intent: IntentType;
 };
 
-/**
- * Use OpenAI to understand:
- *  - mood (sad, happy, heartbreak, chill, party, etc.)
- *  - language (english, hindi, punjabi, tamil, etc.)
- *  - vibe (slow, energetic, lofi, gym, etc.)
- *  - intent ("new" playlist, "more" similar songs, "repeat" same playlist, etc.)
- */
-export async function classifyMoodAndLanguage(
-  message: string
-): Promise<MoodLanguageResult> {
-  // Fallback when no key configured or quota exhausted
-  if (!config.openai.apiKey) {
-    const lower = message.toLowerCase();
-    let mood = "chill";
-    if (lower.includes("sad")) mood = "sad";
-    if (lower.includes("happy")) mood = "happy";
-    if (lower.includes("breakup") || lower.includes("heart")) mood = "heartbreak";
+const systemPrompt = `
+You classify user music requests into structured JSON.
 
-    return {
-      mood,
-      language: null,
-      vibe: null,
-      intent: "other",
-    };
-  }
+Your job is to extract:
+- mood (emotional state like "sad", "happy", "heartbreak", "low", etc.)
+- language (language of the songs requested, like "english", "hindi", etc.)
+- vibe (tempo / feel, like "slow", "chill", "energetic", "gym", "party", etc.)
+- artist (singer / band name, if any)
+- track (specific song name, if any)
+- intent (one of: "playlist", "artist_search", "repeat", "change_vibe", "other")
 
-  const systemPrompt = `
-You are a JSON API that classifies a WhatsApp message for music recommendation.
+INTENT RULES:
+- If the user explicitly mentions an artist or says "songs by X", "music from X",
+  then intent = "artist_search".
+- If the user says "play that again", "repeat that", "same playlist", etc.,
+  then intent = "repeat".
+- If the user says things like "something slower", "more chill", "faster",
+  "more energetic", etc., and refers to changing the feel of current music,
+  then intent = "change_vibe".
+- Otherwise use intent = "playlist".
 
-Extract:
-- "mood": short word like "sad", "happy", "heartbreak", "chill", "party", "focus", etc.
-- "language": user's preferred language ("english", "hindi", "punjabi", "tamil", "telugu", etc.).
-  If not clearly stated, return null.
-- "vibe": optional extra descriptor like "slow", "energetic", "lofi", "gym", "acoustic", etc., or null.
-- "intent": 
-    - "new"    -> user asking for a new playlist or first request.
-    - "more"   -> user wants another / different playlist similar to what they just got
-                  (phrases like "something else", "another", "more like this", "something slower").
-    - "repeat" -> user wants the same playlist again
-                  (phrases like "send again", "same one", "repeat").
-    - "other"  -> anything else.
+Return ONLY a single JSON object. No explanation.
 
-Return JSON ONLY. Example:
+Example correct outputs:
+
+User: "I'm feeling empty after breakup, give me slow english songs"
 {
   "mood": "heartbreak",
   "language": "english",
   "vibe": "slow",
-  "intent": "new"
+  "artist": null,
+  "track": null,
+  "intent": "playlist"
 }
-  `.trim();
+
+User: "Play some gym music by Drake"
+{
+  "mood": "gym",
+  "language": null,
+  "vibe": "energetic",
+  "artist": "drake",
+  "track": null,
+  "intent": "artist_search"
+}
+
+User: "play that again"
+{
+  "mood": null,
+  "language": null,
+  "vibe": null,
+  "artist": null,
+  "track": null,
+  "intent": "repeat"
+}
+`;
+
+export async function classifyMoodAndLanguage(
+  message: string
+): Promise<ClassificationResult> {
+  // If there is no API key, fall back gracefully
+  if (!client.apiKey) {
+    logger.warn("No OPENAI_API_KEY set; falling back to simple classification");
+    const text = message.trim().toLowerCase();
+    return {
+      mood: text || null,
+      language: null,
+      vibe: null,
+      artist: null,
+      track: null,
+      intent: "playlist",
+    };
+  }
 
   const userPrompt = `
 User message: "${message}"
-Return ONLY a JSON object, no explanation.
+
+Extract the fields:
+- mood
+- language
+- vibe
+- artist
+- track
+- intent
+
+If something is not specified, set it to null.
+Return ONLY valid JSON. No extra text.
 `.trim();
 
-const completion = await client.chat.completions.create({
-  model: "gpt-4.1-mini",
-  messages: [
-    { role: "system", content: systemPrompt },
-    { role: "user", content: userPrompt }
-  ],
-  response_format: { type: "json_object" }
-});
-
-const raw = completion.choices[0].message.content || "{}";
-
-
-  let parsed: any;
   try {
-    parsed = JSON.parse(raw);
-  } catch {
-    parsed = {};
-  }
+    const completion = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
 
-  return {
-    mood: parsed.mood ?? null,
-    language: parsed.language ?? null,
-    vibe: parsed.vibe ?? null,
-    intent: parsed.intent ?? "other",
-  };
+    const raw = completion.choices[0].message.content || "{}";
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      logger.error({ err, raw }, "Failed to parse OpenAI classification JSON");
+      parsed = {};
+    }
+
+    const mood =
+      typeof parsed.mood === "string" && parsed.mood.trim()
+        ? parsed.mood.trim().toLowerCase()
+        : null;
+
+    const language =
+      typeof parsed.language === "string" && parsed.language.trim()
+        ? parsed.language.trim().toLowerCase()
+        : null;
+
+    const vibe =
+      typeof parsed.vibe === "string" && parsed.vibe.trim()
+        ? parsed.vibe.trim().toLowerCase()
+        : null;
+
+    const artist =
+      typeof parsed.artist === "string" && parsed.artist.trim()
+        ? parsed.artist.trim().toLowerCase()
+        : null;
+
+    const track =
+      typeof parsed.track === "string" && parsed.track.trim()
+        ? parsed.track.trim()
+        : null;
+
+    let intent: IntentType = "playlist";
+    if (typeof parsed.intent === "string") {
+      const i = parsed.intent.toLowerCase();
+      if (i === "artist_search") intent = "artist_search";
+      else if (i === "repeat") intent = "repeat";
+      else if (i === "change_vibe") intent = "change_vibe";
+      else if (i === "playlist") intent = "playlist";
+      else intent = "other";
+    }
+
+    return {
+      mood,
+      language,
+      vibe,
+      artist,
+      track,
+      intent,
+    };
+  } catch (err: any) {
+    logger.error({ err }, "Error calling OpenAI classifier; using fallback");
+    const text = message.trim().toLowerCase();
+    return {
+      mood: text || null,
+      language: null,
+      vibe: null,
+      artist: null,
+      track: null,
+      intent: "playlist",
+    };
+  }
 }

@@ -17,9 +17,11 @@ async function ensureAccessToken() {
   spotifyApi.setAccessToken(tokenData.body.access_token);
 }
 
-// src/clients/spotifyClient.ts
+// ─────────────────────────────────────────────────────────────
+// Types
+// ─────────────────────────────────────────────────────────────
 
-type TrackInfo = {
+export type TrackInfo = {
   name: string;
   artists: string;
   url?: string;
@@ -36,7 +38,11 @@ type TracksWithMeta = TrackInfo[] & {
   alternatePlaylist?: PlaylistMeta;  // another option for user to try
 };
 
-// NOTE: now accepts optional `language` and `excludePlaylistId`
+// ─────────────────────────────────────────────────────────────
+// Mood / language → playlist (with alternate option)
+// ─────────────────────────────────────────────────────────────
+
+// NOTE: accepts optional `language` and `excludePlaylistId`
 export async function getPlaylistForMood(
   mood: string,
   language?: string,
@@ -123,3 +129,37 @@ export async function getPlaylistForMood(
 
 // keep compatibility with old name
 export const getTracksForMood = getPlaylistForMood;
+
+// ─────────────────────────────────────────────────────────────
+// Artist search (for "search songs by Arijit Singh", etc.)
+// ─────────────────────────────────────────────────────────────
+
+export async function searchTracksByArtist(
+  artist: string,
+  mood?: string,
+  limit = 5
+): Promise<TrackInfo[]> {
+  await ensureAccessToken();
+
+  // Build a search query like: artist:"Arijit Singh" gym
+  const qParts = [`artist:"${artist}"`];
+  if (mood) qParts.push(mood);
+  const query = qParts.join(" ");
+
+  const res = await spotifyApi.searchTracks(query, { limit });
+
+  const items = res.body.tracks?.items ?? [];
+
+  if (!items.length) {
+    logger.warn({ artist, mood, query }, "No tracks found for artist search");
+    return [];
+  }
+
+  const tracks: TrackInfo[] = items.map((t: any) => ({
+    name: t.name as string,
+    artists: (t.artists ?? []).map((a: any) => a.name as string).join(", "),
+    url: t.external_urls?.spotify as string | undefined,
+  }));
+
+  return tracks;
+}
