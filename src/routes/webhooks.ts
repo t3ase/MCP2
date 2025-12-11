@@ -1,7 +1,3 @@
-// ----------------------------------------------
-//  WhatsApp Webhook with ElevenLabs STT Support
-// ----------------------------------------------
-
 import { Router } from "express";
 import { getPlaylistForMood } from "../clients/spotifyClient";
 import { sendTwilioMessage } from "../clients/twilioClient";
@@ -63,9 +59,7 @@ function addHistory(from: string, entry: HistoryEntry) {
   history.set(from, list);
 }
 
-// ----------------------------------------------
-// USER STATS
-// ----------------------------------------------
+//user stats
 
 function getUserStats(from: string) {
   const entries = history.get(from) ?? [];
@@ -113,18 +107,15 @@ function getUserStats(from: string) {
   };
 }
 
-// ----------------------------------------------
-// MAIN WEBHOOK HANDLER
-// ----------------------------------------------
+// webhoook handler
 
 webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
   try {
     const from = req.body.From as string;
     const bodyRaw = req.body.Body as string;
 
-    //------------------------------------------
+    
     // Detect incoming voice message
-    //------------------------------------------
     const numMedia = parseInt(req.body.NumMedia || "0", 10);
     const mediaUrl = numMedia > 0 ? req.body.MediaUrl0 : null;
     const mediaContentType =
@@ -269,7 +260,7 @@ webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
       await sendTwilioMessage(
         from,
         [
-          "📊 Your Listening Stats:",
+          " Your Listening Stats:",
           `• Playlists asked: ${stats.totalPlays}`,
           `• Favorite mood: ${stats.topMood} (${stats.topMoodCount})`,
           `• Favorite language: ${stats.topLanguage} (${stats.topLanguageCount})`,
@@ -335,7 +326,7 @@ webhooksRouter.post("/twilio/whatsapp", async (req, res) => {
       const first = tracks[0];
 
       replyLines.push(
-        `🎧 Playlist Recommendation (${language}):`,
+        `Playlist Recommendation (${language}):`,
         `Playlist: ${playlistMeta.name}`,
         playlistMeta.url ? `Link: ${playlistMeta.url}` : "",
         "",
