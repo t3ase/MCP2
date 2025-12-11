@@ -1,12 +1,12 @@
 # MCP2 – Mood-Based Playlist & Quote Server
 
-A small Express/TypeScript service that classifies incoming WhatsApp/SMS (or HTTP tool calls) by mood/intent and replies with a Spotify playlist and an optional quote/voice response. Endpoints are exposed for Twilio webhooks and for MCP-style tools.
+A small Express/TypeScript service that classifies incoming WhatsApp (or HTTP tool calls) by mood/intent and replies with a Spotify playlist as a response. Endpoints are exposed for Twilio webhooks and for MCP-style tools.
 
 ## Prerequisites
 - Node.js 18+ and npm
 - Spotify Client Credentials (client id/secret)
-- Twilio credentials (for WhatsApp/SMS webhook)
-- Optional: ElevenLabs (voice) and OpenAI API key (LLM classifier; otherwise heuristics are used)
+- Twilio credentials (for WhatsApp)
+- ElevenLabs (voice) and OpenAI API key (LLM classifier; otherwise heuristics are used)
 
 ## Quick Start
 ```bash
@@ -30,7 +30,7 @@ See `config/env.example` for all keys:
 - `LOG_LEVEL`
 - Twilio: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`
 - Spotify: `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`
-- Optional: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `OPENAI_API_KEY`
+- Voice and LLM: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `OPENAI_API_KEY`
 
 ## Routes
 - `POST /webhooks/twilio/whatsapp` — primary webhook for inbound WhatsApp/SMS. Handles text and voice (ElevenLabs STT) and replies via Twilio.
